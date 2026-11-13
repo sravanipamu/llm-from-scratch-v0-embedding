@@ -1,6 +1,6 @@
 # llm-from-scratch-v0-embedding
 
-A small next-word language model, written from scratch in PyTorch, that adds **token embeddings, positional embeddings and a linear output layer** on top of the dummy model.
+A small next-word language model, built step by step in PyTorch, that adds **token embeddings, positional embeddings and a linear output layer** on top of the dummy model.
 
 > **This project extends [llm-from-scratch-dummy](https://github.com/sravanipamu/llm-from-scratch-dummy).**
 > Start with the dummy project if you haven't seen it. It explains the basic training loop with a 2-parameter model. This project keeps the same loop and replaces the model with the first real building blocks of a GPT-style LLM.
@@ -50,45 +50,125 @@ There's no **attention** yet. Each position predicts the next token using only i
 
 ## 2. Architecture
 
-```
-               ┌──────────────────────────────────────────────────────────────┐
-  Text   ──►   │ Tokenizer          "He reads books ." ──► [1, 49, 5, 0]      │
-               ├──────────────────────────────────────────────────────────────┤
-               │ Dataset            x = first 6 tokens                        │
-               │ (next-token)       y = same tokens shifted right by 1        │
-               ├──────────────────────────────────────────────────────────────┤
-               │ Token Embedding    nn.Embedding(70, 24)   id  ──► vector     │
-               │        +                                                     │
-               │ Position Embedding nn.Embedding(6, 24)    pos ──► vector     │
-               ├──────────────────────────────────────────────────────────────┤
-               │ Output Layer       nn.Linear(24, 70)  vector ──► 70 logits   │
-               ├──────────────────────────────────────────────────────────────┤
-               │ Loss + Optimizer   CrossEntropyLoss, AdamW (lr = 0.0003)     │
-               ├──────────────────────────────────────────────────────────────┤
-               │ Generator          argmax(logits) ──► next id ──► repeat     │
-               └──────────────────────────────────────────────────────────────┘
-```
+### The big picture
 
-Shapes for one batch (batch size `B = 4`, context `T = 6`):
+The model has one job: **look at a word and guess the word that comes next.** It does this in four steps:
 
 ```
-input ids        (B, T)          = (4, 6)
-token embeds     (B, T, EMB_DIM) = (4, 6, 24)
-+ pos embeds     (T, EMB_DIM)    = (6, 24)      broadcast over the batch
-= x              (4, 6, 24)
-logits           (B, T, VOCAB)   = (4, 6, 70)
+   "He reads"
+       │
+       ▼
+ ① Tokenizer        Turn each word into a number       "He reads"  →  [1, 49]
+       │
+       ▼
+ ② Embeddings       Turn each number into a list of    49  →  [0.12, -0.80, ... ]
+                    24 numbers that describe the word        (24 numbers)
+                    and where it sits in the sentence
+       │
+       ▼
+ ③ Output layer     Give every word in the vocabulary  "books": 8.1   "piano": 0.3
+                    a score (70 scores in total)       "novel": 5.6   ...
+       │
+       ▼
+ ④ Pick the winner  The word with the highest score    →  "books"
+                    is the model's guess
 ```
 
-| Component | What it does | Parameters |
+To write more than one word, the model adds its guess to the end of the input and repeats the steps.
+
+### Each step in plain words
+
+**① Tokenizer: words → numbers**
+
+Computers can't read words, so each word gets a number, like a roll number in a class. `He` is `1`, `reads` is `49`, and so on for all 70 words. The number is only a name tag: `49` is not "more" than `1`.
+
+**② Embeddings: numbers → descriptions**
+
+A single number can't say anything about a word, so the model swaps it for a list of 24 numbers. Think of it as a **profile card** for the word. There are two kinds of card:
+
+- **Token embedding:** one card per word (70 cards). At the start the cards are random. During training the model fills them in, and words used in the same way (like `He` and `She`) end up with similar cards.
+- **Position embedding:** one card per place in the sentence (6 cards: 1st word, 2nd word, ... 6th word). It tells the model *where* a word is.
+
+The model adds the two cards together. So `He` as the 1st word looks slightly different from `He` as the 4th word.
+
+**③ Output layer: description → scores**
+
+The output layer reads the combined card and gives a score to each of the 70 words. A higher score means "I think this word comes next." These scores are called **logits**.
+
+**④ Pick the winner**
+
+The model chooses the word with the highest score. This is called **greedy decoding**.
+
+> All four steps are in the `GPTModel` class and the `generate` function in `v0.ipynb`.
+
+### How the model learns
+
+At first the profile cards are random, so the guesses are random too. Training works like practising with an answer key:
+
+```
+  ┌──────────► 1. Guess    The model scores every word for the next position
+  │                │
+  │                ▼
+  │            2. Check    Cross-entropy loss gives one number for "how wrong was I?"
+  │                │       (big = very wrong, small = close)
+  │                ▼
+  │            3. Blame    Backpropagation works out how much each number
+  │                │       in the model caused the mistake
+  │                ▼
+  │            4. Fix      The AdamW optimizer nudges each number a little
+  │                │       so the next guess is better
+  └── repeat ──────┘       (100 rounds over all 16 sentences)
+```
+
+In the code, each step is one line, and PyTorch does the maths for you:
+
+| Step | Code in `v0.ipynb` |
+|---|---|
+| 1. Guess | `logits = model(X)` |
+| 2. Check | `loss = loss_fn(...)`, where `loss_fn = nn.CrossEntropyLoss()` |
+| 3. Blame | `loss.backward()` |
+| 4. Fix | `optimizer.step()`, where `optimizer = torch.optim.AdamW(...)` |
+
+**Where does the answer key come from?** From the sentences themselves. In every sentence, the correct answer for each word is simply the word after it:
+
+| Position | Word | Correct next word |
 |---|---|---|
-| **Tokenizer** | Separates `.` from words, splits on spaces and maps each token to an ID. | – |
-| **`LLMDataset` / DataLoader** | Takes the first `CONTEXT_LEN + 1` tokens of each sentence and makes input `x` and target `y` (shifted by one). | – |
-| **`tok_emb`** | Lookup table: one learned 24-number vector per vocabulary token. | 70 × 24 = 1,680 |
-| **`pos_emb`** | Lookup table: one learned 24-number vector per position (0–5). | 6 × 24 = 144 |
-| **`output_layer`** | Turns each 24-number vector into 70 scores (logits), one per token. | 24 × 70 = 1,680 |
-| **Loss** | `CrossEntropyLoss` compares the logits with the correct next-token ID. | – |
-| **Optimizer** | `AdamW` updates all 3,504 parameters. | – |
-| **Generator** | Repeatedly predicts the next token and appends it to the input. | – |
+| 1 | She | composes |
+| 2 | composes | songs |
+| 3 | songs | and |
+| 4 | and | practices |
+| 5 | practices | piano |
+| 6 | piano | daily |
+
+So one sentence gives the model six small questions to practise on.
+
+### What the model stores
+
+Everything the model learns is stored as numbers called **parameters**. Training changes these numbers. Nothing else in the model changes.
+
+| Part | What it stores | Count |
+|---|---|---|
+| Token embedding (`tok_emb`) | 70 word cards × 24 numbers | 1,680 |
+| Position embedding (`pos_emb`) | 6 position cards × 24 numbers | 144 |
+| Output layer (`output_layer`) | 24 × 70 weights that turn a card into 70 scores | 1,680 |
+| **Total** | | **3,504** |
+
+For comparison, GPT-3 has about 175 billion parameters. The idea is the same; only the size is different.
+
+<details>
+<summary><b>For curious readers: data shapes inside the model</b></summary>
+
+The model handles 4 sentences at a time (a **batch**), and each one is 6 words long. The numbers in brackets are the size of the data at each step:
+
+```
+Word numbers         (4, 6)        4 sentences × 6 words
+Token cards          (4, 6, 24)    each word becomes 24 numbers
++ Position cards     (6, 24)       one card per position, shared by all 4 sentences
+= Combined cards     (4, 6, 24)
+Scores (logits)      (4, 6, 70)    70 scores for every word in every sentence
+```
+
+</details>
 
 ---
 
@@ -96,14 +176,14 @@ logits           (B, T, VOCAB)   = (4, 6, 70)
 
 ```mermaid
 flowchart LR
-    A[16 raw sentences] --> B[Separate '.'<br/>build 70-token vocab]
-    B --> C[Tokenize<br/>text → ids]
-    C --> D[Dataset<br/>x = ids 0..5<br/>y = ids 1..6]
-    D --> E[Token emb + Position emb<br/>4×6×24]
-    E --> F[Linear output layer<br/>4×6×70 logits]
-    F --> G[Cross-entropy loss<br/>backprop, AdamW step]
-    G -->|100 epochs| E
-    G --> H[Generate<br/>'He reads' → next tokens]
+    A[16 sentences] --> B[Make a list<br/>of all 70 words]
+    B --> C[Turn words<br/>into numbers]
+    C --> D[Pair each word<br/>with the next word]
+    D --> E[Embeddings<br/>word + position cards]
+    E --> F[Output layer<br/>a score for every word]
+    F --> G[Measure the error<br/>and fix the numbers]
+    G -->|repeat 100 times| E
+    G --> H[Write new text<br/>from 'He reads']
 ```
 
 Step by step, in the same order as the notebook:
@@ -118,7 +198,7 @@ Step by step, in the same order as the notebook:
 8. **Build the dataset:** keep the first 7 tokens, then `x = tokens[:-1]` and `y = tokens[1:]`. The DataLoader groups them into 4 batches of 4.
 9. **Create the model:** token embedding + positional embedding + linear output layer.
 10. **Count parameters:** 3,504 in total (see the table above).
-11. **Train:** for 100 epochs, compute logits, flatten them, compute cross-entropy loss, backpropagate and update.
+11. **Train:** repeat 100 times (100 **epochs**): make guesses, measure how wrong they are with cross-entropy loss, work out the corrections with backpropagation, and update the numbers with AdamW.
 12. **Generate:** start from a prompt, predict the next token with `argmax`, append it and repeat until the context is full.
 
 ---
